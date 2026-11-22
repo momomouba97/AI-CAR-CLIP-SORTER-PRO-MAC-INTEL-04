@@ -1,0 +1,132 @@
+name: Build macOS Intel DMG
+
+# شغّله يدوياً مرة واحدة: Actions → Build macOS Intel DMG → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      strict_macos_check:
+        description: "افشل البناء إذا احتاج أي ملف macOS أحدث من 11.7 (Big Sur)"
+        type: boolean
+        default: true
+
+jobs:
+  build-dmg:
+    # آخر Runner أصلي x86_64 يوفره GitHub (مدعوم حتى أغسطس 2027)
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      APP_NAME: "AI CAR CLIP SORTER PRO"
+      DMG_NAME: "AI-CAR-CLIP-SORTER-PRO-MAC-INTEL.dmg"
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm Intel (x86_64) runner
+        run: |
+          uname -m
+          sw_vers
+          test "$(uname -m)" = "x86_64"
+
+      # بايثون الرسمي من python.org مبني للعمل على macOS 10.9+/11+ (أضمن لـ Big Sur من نسخ الـ Runner)
+      - name: Install Python 3.11 (python.org)
+        run: |
+          curl -fsSL --retry 3 --retry-delay 5 -o python.pkg https://www.python.org/ftp/python/3.11.9/python-3.11.9-macos11.pkg
+          sudo installer -pkg python.pkg -target /
+          /Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11 -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: |
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Diagnostics - OpenSSL libraries (informational)
+        run: |
+          python - <<'PY'
+          import cryptography, ssl, sys, glob, os, subprocess
+          print("python", sys.version.split()[0], "| cryptography", cryptography.__version__, "|", ssl.OPENSSL_VERSION)
+          for so in glob.glob(os.path.join(os.path.dirname(cryptography.__file__), "hazmat/bindings/_rust*.so")):
+              print(subprocess.run(["otool", "-L", so], capture_output=True, text=True).stdout)
+          PY
+
+      - name: Prepare FFmpeg (bundled static binary)
+        run: python scripts/prepare_ffmpeg.py
+
+      - name: Generate app icon
+        run: |
+          python scripts/make_icon.py assets/icon.png
+          bash scripts/make_icns.sh
+
+      - name: Run unit tests
+        run: python -m pytest -q tests
+
+      - name: Build .app with PyInstaller
+        run: python -m PyInstaller AICarClipSorterPro.spec --noconfirm --clean
+
+      - name: Verify .app exists
+        run: |
+          APP="dist/$APP_NAME.app"
+          test -d "$APP"
+          test -x "$APP/Contents/MacOS/AICarClipSorterPro"
+          /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist"
+          file "$APP/Contents/MacOS/AICarClipSorterPro"
+          du -sh "$APP"
+
+      - name: Check Big Sur (macOS 11) compatibility of every binary
+        run: |
+          if [ "${{ inputs.strict_macos_check }}" = "true" ]; then
+            python scripts/check_min_macos.py "dist/$APP_NAME.app"
+          else
+            python scripts/check_min_macos.py "dist/$APP_NAME.app" --warn-only
+          fi
+
+      # توقيع Ad-hoc فقط (ليس Notarization ولا Developer ID)
+      - name: Ad-hoc sign
+        run: |
+          codesign --force --deep --sign - "dist/$APP_NAME.app"
+          codesign --verify --deep --strict --verbose=2 "dist/$APP_NAME.app"
+
+      - name: Self-test the built app (FFmpeg, scene detection, export, UI)
+        run: |
+          set -o pipefail
+          "dist/$APP_NAME.app/Contents/MacOS/AICarClipSorterPro" --selftest 2>&1 | tee selftest.log
+
+      - name: Create DMG
+        run: |
+          rm -rf dmg_stage && mkdir dmg_stage
+          cp -R "dist/$APP_NAME.app" dmg_stage/
+          ln -s /Applications dmg_stage/Applications
+          hdiutil create -volname "$APP_NAME" -srcfolder dmg_stage -ov -format UDZO -fs HFS+ "$DMG_NAME"
+          ls -lh "$DMG_NAME"
+
+      - name: Verify DMG integrity and contents
+        run: |
+          hdiutil verify "$DMG_NAME"
+          mkdir -p /tmp/dmgcheck
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/dmgcheck "$DMG_NAME"
+          test -d "/tmp/dmgcheck/$APP_NAME.app"
+          test -L /tmp/dmgcheck/Applications
+          hdiutil detach /tmp/dmgcheck
+          shasum -a 256 "$DMG_NAME" | tee "$DMG_NAME.sha256"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-CAR-CLIP-SORTER-PRO-MAC-INTEL
+          path: |
+            AI-CAR-CLIP-SORTER-PRO-MAC-INTEL.dmg
+            AI-CAR-CLIP-SORTER-PRO-MAC-INTEL.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/**/warn-*.txt
+            selftest.log
+          if-no-files-found: ignore
