@@ -1,0 +1,4 @@
+APP_NAME = "AI CAR CLIP SORTER PRO ULTIMATE"
+APP_SHORT = "AI CAR CLIP SORTER PRO"
+APP_ID = "AICarClipSorterPro"
+__version__ = "1.0.0"
